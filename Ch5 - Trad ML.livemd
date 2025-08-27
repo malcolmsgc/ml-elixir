@@ -1,0 +1,290 @@
+# Ch5: Trad ML
+
+```elixir
+Mix.install([
+  {:scholar, "~> 0.2"},
+  {:nx, "~> 0.5"},
+  {:exla, "~> 0.5"},
+  {:vega_lite, "~> 0.1.6"},
+  {:kino_vega_lite, "~> 0.1.6"},
+  {:scidata, "~> 0.1"}
+])
+```
+
+## Linear regression
+
+```elixir
+Nx.default_backend(EXLA.Backend)
+Nx.Defn.default_options(compiler: EXLA)
+```
+
+```elixir
+# Generate test data
+
+m = :rand.uniform() * 10
+b = :random.uniform() * 10
+
+key = Nx.Random.key(42)
+size = 100
+{x, new_key} = Nx.Random.normal(key, 0.0, 1.0, shape: {size, 1})
+{noise_x, new_key} = Nx.Random.normal(new_key, 0.0, 1.0, shape: {size, 1})
+
+Nx.shape(x) |> IO.inspect()
+
+y =
+  m
+  |> Nx.multiply(Nx.add(x, noise_x))
+  |> Nx.add(b)
+```
+
+```elixir
+# Graph test data
+
+alias VegaLite, as: Vl
+
+Vl.new(title: "Scatterplot", width: 720, height: 480)
+|> Vl.data_from_values(%{
+  x: Nx.to_flat_list(x),
+  y: Nx.to_flat_list(y)
+})
+|> Vl.mark(:point)
+|> Vl.encode_field(:x, "x", type: :quantitative)
+|> Vl.encode_field(:y, "y", type: :quantitative)
+```
+
+```elixir
+model = Scholar.Linear.LinearRegression.fit(x,y)
+```
+
+```elixir
+Scholar.Linear.LinearRegression.predict(model, Nx.iota({3, 1}))
+```
+
+```elixir
+# Generate prediction points
+pred_xs = Nx.linspace(-3.0, 3.0, n: 100) |> Nx.new_axis(-1) 
+pred_xs |> Nx.shape() |> IO.inspect()
+pred_ys = Scholar.Linear.LinearRegression.predict(model, pred_xs)
+
+# Plot against training set
+title = "Scatterplot Distribution and Fit Curve"
+Vl.new(title: title, width: 720, height: 480) 
+|> Vl.data_from_values(%{
+  x: Nx.to_flat_list(x),
+  y: Nx.to_flat_list(y), 
+  pred_x: Nx.to_flat_list(pred_xs),
+  pred_y: Nx.to_flat_list(pred_ys)
+})
+|> Vl.layers([
+  Vl.new() 
+  |> Vl.mark(:point)
+  |> Vl.encode_field(:x, "x", type: :quantitative)
+  |> Vl.encode_field(:y, "y", type: :quantitative), Vl.new()
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "pred_x", type: :quantitative)
+  |> Vl.encode_field(:y, "pred_y", type: :quantitative)
+])
+
+```
+
+## Logistic regression
+
+A close relative of linear regression that’s often used for classification problems is logistic regression. Logistic regression is almost identical to linear regression. However, after applying the linear transformation on the input variables, you also apply a logistic function, which squeezes the output between 0 and 1. Often, the output represents a probability for a binary classification problem. But it can also be extended to work for multi-class classification problems.
+
+```elixir
+# Download dataset
+{inputs, targets} = Scidata.Wine.download()
+```
+
+```elixir
+# Split into test and training
+
+{train, test} =
+  inputs
+  |> Enum.zip(targets)
+  |> Enum.shuffle()
+  |> Enum.split(floor(length(inputs) * 0.8))
+
+# training set
+{train_inputs, train_targets} = Enum.unzip(train)
+train_inputs = Nx.tensor(train_inputs)
+train_targets = Nx.tensor(train_targets)
+
+# test set
+{test_inputs, test_targets} = Enum.unzip(test)
+test_inputs = Nx.tensor(test_inputs)
+test_targets = Nx.tensor(test_targets)
+```
+
+```elixir
+# Normalise
+train_inputs = Scholar.Preprocessing.min_max_scale(train_inputs)
+test_inputs = Scholar.Preprocessing.min_max_scale(test_inputs)
+```
+
+```elixir
+logr_model =
+  Scholar.Linear.LogisticRegression.fit(
+    train_inputs,
+    train_targets,
+    num_classes: 3
+  )
+```
+
+Notice that you must specify `num_classes: 3` because the original dataset has three classes. This code will treat the original problem as a multi-class classification problem.
+
+```elixir
+# Test and measure
+test_preds = Scholar.Linear.LogisticRegression.predict(logr_model, test_inputs)
+
+Scholar.Metrics.Classification.accuracy(test_targets, test_preds)
+Scholar.Metrics.Classification.confusion_matrix(test_targets, test_preds, num_classes: 3)
+
+
+```
+
+The columns represent the predicted class, and the rows represent the actual class.
+
+```elixir
+Vl.new(title: "Confusion Matrix", width: 600, height: 600)
+|> Vl.data_from_values(%{
+  predicted: Nx.to_flat_list(test_preds),
+  actual: Nx.to_flat_list(test_targets)
+})
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "predicted")
+|> Vl.encode_field(:y, "actual")
+|> Vl.encode(:color, aggregate: :count)
+```
+
+## K-Nearest Neighbours
+
+```elixir
+train_targets =
+  Nx.reshape(train_targets, {142, 1})
+
+knn_model =
+  Scholar.Neighbors.KNNRegressor.fit(
+    train_inputs,
+    train_targets,
+    [num_neighbors: 3]
+  )
+
+# knn_model =
+#   Scholar.Neighbors.KNNClassifier.fit(
+#     train_inputs,
+#     train_targets,
+#     num_neighbors: 5,
+#     num_classes: 3
+#   )
+```
+
+```elixir
+test_preds =
+  # Scholar.Neighbors.KNNRegressor.predict(knn_model, test_inputs)
+  Scholar.Neighbors.KNNClassifier.predict(knn_model, test_inputs)
+
+  # |> Nx.reshape({36})
+
+  # test_preds[..]
+  |> Nx.squeeze()
+#   |> Nx.floor()
+# |> Nx.as_type(:u8)
+
+# test_preds =
+#   test_preds
+#   |> Nx.reshape({36})
+```
+
+```elixir
+test_preds
+|> IO.inspect
+
+Scholar.Metrics.Classification.accuracy(test_targets, test_preds)
+
+```
+
+```elixir
+Scholar.Metrics.Classification.confusion_matrix(test_targets, test_preds, num_classes: 3)
+```
+
+```elixir
+Vl.new(title: "Confusion Matrix", width: 600, height: 600)
+|> Vl.data_from_values(%{
+  predicted: Nx.to_flat_list(test_preds),
+  actual: Nx.to_flat_list(test_targets)
+})
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "predicted")
+|> Vl.encode_field(:y, "actual")
+|> Vl.encode(:color, aggregate: :count)
+```
+
+## Clustering
+
+```elixir
+# K-Means as an unsupervised approach to classification.
+
+km_model = Scholar.Cluster.KMeans.fit(train_inputs, num_clusters: 3)
+```
+
+```elixir
+wine_features = %{
+  "feature_1" =>
+    train_inputs[[.., 1]]
+    |> Nx.to_flat_list(),
+  "feature_2" =>
+    train_inputs[[.., 2]]
+    |> Nx.to_flat_list(),
+  "class" =>
+    train_targets
+    |> Nx.to_flat_list()
+}
+
+coords = [
+  cluster_feature_1:
+    km_model.clusters[[.., 1]]
+    |> Nx.to_flat_list(),
+  cluster_feature_2:
+    km_model.clusters[[.., 2]]
+    |> Nx.to_flat_list()
+]
+
+title =
+  "Scatterplot of data samples projected on plane wine" <>
+    " feature 1 x wine feature 2"
+
+Vl.new(
+  width: 600,
+  height: 600,
+  title: [
+    text: title,
+    offset: 25
+  ]
+)
+|> Vl.layers([
+  Vl.new()
+  |> Vl.data_from_values(wine_features)
+  |> Vl.mark(:circle)
+  |> Vl.encode_field(:x, "feature_1", type: :quantitative)
+  |> Vl.encode_field(:y, "feature_2", type: :quantitative)
+  |> Vl.encode_field(:color, "class"),
+  Vl.new()
+  |> Vl.data_from_values(coords)
+  |> Vl.mark(:circle, color: :green, size: 200)
+  |> Vl.encode_field(:x, "cluster_feature_1", type: :quantitative)
+  |> Vl.encode_field(:y, "cluster_feature_2", type: :quantitative)
+])
+```
+
+```elixir
+test_preds = Scholar.Cluster.KMeans.predict(km_model, test_inputs)
+```
+
+```elixir
+Scholar.Metrics.Classification.accuracy(test_targets, test_preds)
+```
+
+See EXGBoost for decision trees
+
+https://github.com/acalejos/exgboost
