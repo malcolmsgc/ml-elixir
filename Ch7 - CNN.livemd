@@ -25,8 +25,11 @@ defmodule CatsAndDogs do
     |> Enum.shuffle()
     |> Task.async_stream(&parse_image/1)
     |> Stream.filter(fn
-      {:ok, {%StbImage{}, _}} -> true
-      _ -> false
+      {:ok, {%StbImage{}, _}} ->
+        true
+
+      _ ->
+        false
     end)
     |> Stream.map(&to_tensors(&1, target_height, target_width))
     |> Stream.chunk_every(batch_size, batch_size, :discard)
@@ -48,7 +51,8 @@ defmodule CatsAndDogs do
   end
 
   defp parse_image(path) do
-    label = if String.contains?(path, "cat"), do: 0, else: 0
+    filename = Path.basename(path, ".jpg")
+    label = if String.contains?(filename, "cat"), do: 0, else: 1
 
     case StbImage.read_file(path) do
       {:ok, img} -> {img, label}
@@ -83,11 +87,50 @@ train_pipeline =
 
 test_pipeline =
   CatsAndDogs.pipeline(
-    train_paths,
+    test_paths,
     batch_size,
     target_height,
     target_width
   )
-
 Enum.take(train_pipeline, 1)
+Enum.take(test_pipeline, 1)
 ```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## MLP as baseline
+
+Not required. Done in this case to compare performance vs CNN.
+
+```elixir
+mlp_model =
+  Axon.input("images", shape: {nil, target_height, target_width, 3})
+  |> Axon.flatten()
+  |> Axon.dense(256, activation: :relu)
+  |> Axon.dense(128, activation: :relu)
+  |> Axon.dense(1, activation: :sigmoid)
+```
+
+```elixir
+mlp_template = Nx.template({batch_size, target_height, target_width ,3}, :f32)
+Axon.Display.as_graph(mlp_model, mlp_template)
+```
+
+```elixir
+mlp_trained_model_state =
+  mlp_model
+  |> Axon.Loop.trainer(:binary_cross_entropy, :adam)
+  |> Axon.Loop.metric(:accuracy)
+  |> Axon.Loop.run(train_pipeline, %{}, epochs: 5, compiler: EXLA)
+```
+
+```elixir
+mlp_model
+|> Axon.Loop.evaluator()
+|> Axon.Loop.metric(:accuracy)
+|> Axon.Loop.run(test_pipeline, mlp_trained_model_state, compiler: EXLA)
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## CNN
