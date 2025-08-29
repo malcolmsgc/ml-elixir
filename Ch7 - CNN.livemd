@@ -20,7 +20,8 @@ Nx.global_default_backend(EXLA.Backend)
 
 ```elixir
 defmodule CatsAndDogs do
-  def pipeline(paths, batch_size, target_height, target_width) do
+
+  def pipeline(paths, batch_size, target_height, target_width, augment \\ false) do
     paths
     |> Enum.shuffle()
     |> Task.async_stream(&parse_image/1)
@@ -32,11 +33,22 @@ defmodule CatsAndDogs do
         false
     end)
     |> Stream.map(&to_tensors(&1, target_height, target_width))
+    |> augment_data(augment)
     |> Stream.chunk_every(batch_size, batch_size, :discard)
     |> Stream.map(fn chunks ->
       {img_chunk, label_chunk} = Enum.unzip(chunks)
       {Nx.stack(img_chunk), Nx.stack(label_chunk)}
     end)
+  end
+
+  defp augment_data(stream, augment) do
+    if augment do
+      stream
+      |> Stream.map(&random_flip(&1, :height))
+      |> Stream.map(&random_flip(&1, :width))
+    else
+      stream
+    end
   end
 
   defp to_tensors({:ok, {img, label}}, target_height, target_width) do
@@ -59,6 +71,14 @@ defmodule CatsAndDogs do
       _error -> :error
     end
   end
+
+  defp random_flip({image, label}, axis) do
+    if :rand.uniform() < 0.5 do
+      {Nx.reverse(image, axes: [axis]), label}
+    else
+      {image, label}
+    end
+  end
 end
 ```
 
@@ -73,6 +93,8 @@ base_path = "Dev/Education/Elixir/ml/Datasets/"
   |> Enum.shuffle()
   |> Enum.split(1000)
 
+{test_paths, val_paths} = test_paths |> Enum.split(750)
+
 batch_size = 128
 target_height = 96
 target_width = 96
@@ -82,7 +104,19 @@ train_pipeline =
     train_paths,
     batch_size,
     target_height,
-    target_width
+    target_width,
+    true
+  )
+
+# Notice that you don’t want to apply augmentations to your test or validation pipeline. 
+# You don’t want to make classification more difficult for your model at test time.
+val_pipeline =
+  CatsAndDogs.pipeline(
+    val_paths,
+    batch_size,
+    target_height,
+    target_width,
+    false
   )
 
 test_pipeline =
@@ -90,10 +124,12 @@ test_pipeline =
     test_paths,
     batch_size,
     target_height,
-    target_width
+    target_width,
+    false
   )
-Enum.take(train_pipeline, 1)
-Enum.take(test_pipeline, 1)
+
+# Enum.take(train_pipeline, 1)
+# Enum.take(test_pipeline, 1)
 ```
 
 <!-- livebook:{"branch_parent_index":1} -->
@@ -134,3 +170,97 @@ mlp_model
 <!-- livebook:{"branch_parent_index":1} -->
 
 ## CNN
+
+This code uses Nx.conv to implement a basic edge detector.
+
+```elixir
+img_path = base_path <> "dogs-vs-cats/train/dog.5.jpg"
+
+img =
+  img_path
+  |> StbImage.read_file!()
+  |> StbImage.to_nx()
+  |> Nx.transpose(axes: [:channels, :height, :width])
+  |> Nx.new_axis(0)
+
+kernel =
+  Nx.tensor([
+    [-1, 0, 1],
+    [-1, 0, 1],
+    [-1, 0, 1]
+  ])
+
+kernel =
+  kernel
+  |> Nx.reshape({1, 1, 3, 3})
+  |> Nx.broadcast({3, 3, 3, 3})
+
+img
+|> Nx.conv(kernel)
+|> Nx.as_type({:u, 8})
+|> Nx.squeeze(axes: [0])
+|> Nx.transpose(axes: [:height, :width, :channels])
+|> Kino.Image.new()
+```
+
+### The CNN model
+
+```elixir
+cnn_model =
+  Axon.input("images", shape: {nil, 96, 96, 3})
+  # convolutional block 1
+  |> Axon.conv(32,
+    kernel_size: {3, 3},
+    padding: :same,
+    activation: :relu
+  )
+  |> Axon.max_pool(
+    kernel_size: {2, 2},
+    strides: [2, 2]
+  )
+  # convolutional block 2
+  |> Axon.conv(128,
+    kernel_size: {3, 3},
+    padding: :same,
+    activation: :relu
+  )
+  |> Axon.max_pool(
+    kernel_size: {2, 2},
+    strides: [2, 2]
+  )
+  # flatten (or pool)
+  |> Axon.flatten()
+  # fully connected head
+  |> Axon.dense(128, activation: :relu)
+  |> Axon.dropout(rate: 0.5)
+  |> Axon.dense(1, activation: :sigmoid)
+
+template = Nx.template({1, 96, 96, 3}, :f32)
+
+Axon.Display.as_graph(cnn_model, template)
+```
+
+Note that `Axon.conv` adds the activation layer in.
+
+<!-- livebook:{"break_markdown":true} -->
+
+### Training
+
+```elixir
+cnn_trained_model_state =
+  cnn_model
+  |> Axon.Loop.trainer(:binary_cross_entropy, Polaris.Optimizers.adam(learning_rate: 1.0e-3))
+  |> Axon.Loop.metric(:accuracy)
+  |> Axon.Loop.validate(cnn_model, val_pipeline)
+  |> Axon.Loop.early_stop("validation_loss", mode: :min)
+  |> Axon.Loop.run(train_pipeline, %{}, epochs: 100, compiler: EXLA)
+```
+
+Run test set eval
+
+```elixir
+cnn_model
+|> Axon.Loop.evaluator()
+|> Axon.Loop.metric(:accuracy)
+|> Axon.Loop.run(test_pipeline, cnn_trained_model_state, compiler: EXLA)
+```
