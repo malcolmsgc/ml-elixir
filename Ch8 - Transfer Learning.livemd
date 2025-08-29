@@ -1,0 +1,133 @@
+# Ch8: Transfer Learning
+
+```elixir
+Mix.install([
+  {:axon_onnx, github: "elixir-nx/axon_onnx"},
+  {:axon, "~> 0.5"},
+  {:nx, "~> 0.5"},
+  {:exla, "~> 0.5"},
+  {:stb_image, "~> 0.6"},
+  {:kino, "~> 0.8"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## Setup: Reuse pipeline from Ch7
+
+There's a minor alteration from the ch7 pipeline. We'll use a channels first model and so need to transpose the image matrices.
+
+There are also some minor adjustments to batch size and image dimensions. The latter is because the model will need larger image sizes.
+
+```elixir
+defmodule CatsAndDogs do
+  def pipeline(paths, batch_size, target_height, target_width, augment \\ false) do
+    paths
+    |> Enum.shuffle()
+    |> Task.async_stream(&parse_image/1)
+    |> Stream.filter(fn
+      {:ok, {%StbImage{}, _}} ->
+        true
+
+      _ ->
+        false
+    end)
+    |> Stream.map(&to_tensors(&1, target_height, target_width))
+    |> augment_data(augment)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn chunks ->
+      {img_chunk, label_chunk} = Enum.unzip(chunks)
+      {Nx.stack(img_chunk), Nx.stack(label_chunk)}
+    end)
+  end
+
+  defp augment_data(stream, augment) do
+    if augment do
+      stream
+      |> Stream.map(&random_flip(&1, :height))
+      |> Stream.map(&random_flip(&1, :width))
+    else
+      stream
+    end
+  end
+
+  defp to_tensors({:ok, {img, label}}, target_height, target_width) do
+    img_tensor =
+      img
+      |> StbImage.resize(target_height, target_width)
+      |> StbImage.to_nx()
+      |> Nx.divide(255)
+      # This is addition to pipeline to allow for channels first model
+      |> Nx.transpose(axes: [:channels, :height, :width])
+
+    label_tensor = Nx.tensor([label])
+    {img_tensor, label_tensor}
+  end
+
+  defp parse_image(path) do
+    filename = Path.basename(path, ".jpg")
+    label = if String.contains?(filename, "cat"), do: 0, else: 1
+
+    case StbImage.read_file(path) do
+      {:ok, img} -> {img, label}
+      _error -> :error
+    end
+  end
+
+  defp random_flip({image, label}, axis) do
+    if :rand.uniform() < 0.5 do
+      {Nx.reverse(image, axes: [axis]), label}
+    else
+      {image, label}
+    end
+  end
+end
+```
+
+```elixir
+base_path = "Dev/Education/Elixir/ml/Datasets/"
+
+{test_paths, train_paths} =
+  (base_path <> "dogs-vs-cats/train/*.jpg")
+  |> Path.wildcard()
+  |> Enum.shuffle()
+  |> Enum.split(1000)
+
+{test_paths, val_paths} = test_paths |> Enum.split(750)
+
+batch_size = 32
+target_height = 160
+target_width = 160
+
+train_pipeline =
+  CatsAndDogs.pipeline(
+    train_paths,
+    batch_size,
+    target_height,
+    target_width,
+    true
+  )
+
+# Notice that you don’t want to apply augmentations to your test or validation pipeline. 
+# You don’t want to make classification more difficult for your model at test time.
+val_pipeline =
+  CatsAndDogs.pipeline(
+    val_paths,
+    batch_size,
+    target_height,
+    target_width,
+    false
+  )
+
+test_pipeline =
+  CatsAndDogs.pipeline(
+    test_paths,
+    batch_size,
+    target_height,
+    target_width,
+    false
+  )
+
+# Enum.take(train_pipeline, 1)
+# Enum.take(test_pipeline, 1)
+```
