@@ -233,7 +233,7 @@ trained_model_state =
   |> Axon.Loop.run(
     train_pipeline,
     cnn_params,
-    epochs: 1,
+    epochs: 100,
     compiler: EXLA
   )
 ```
