@@ -7,7 +7,8 @@ Mix.install([
   {:nx, "~> 0.5"},
   {:exla, "~> 0.5"},
   {:stb_image, "~> 0.6"},
-  {:kino, "~> 0.8"}
+  {:kino, "~> 0.8"},
+  {:table_rex, "~> 3.1.1"}
 ])
 
 Nx.global_default_backend(EXLA.Backend)
@@ -135,32 +136,165 @@ test_pipeline =
 # Enum.take(test_pipeline, 1)
 ```
 
+## Transfer learning
+
 Import the model
 
 ```elixir
-{cnn_base, cnn_base_params} = AxonOnnx.import(
-    base_path <> "Models/mobilenetv2-7.onnx", batch_size: batch_size   )
+{mn_2_7_model, mn_2_7_params} =
+  AxonOnnx.import(
+    base_path <> "Models/mobilenetv2-7.onnx",
+    batch_size: batch_size
+  )
 ```
 
 ```elixir
 input_template = Nx.template({1, 3, target_height, target_width}, :f32)
-Axon.Display.as_graph(cnn_base, input_template)
+Axon.Display.as_graph(mn_2_7_model, input_template)
 
 
 ```
 
 ```elixir
-{_popped, [cnn_base]} = 
-  cnn_base |> Axon.pop_node() 
+{_popped, [cnn_base]} =
+  mn_2_7_model |> Axon.pop_node()
 
 # Debugging match on pop_node
 # match?(%Axon{output: id, nodes: nodes}, cnn_base)
+# Map.keys(cnn_base)
 
-{_popped, [cnn_base]} = 
-  cnn_base |> Axon.pop_node() 
+{_popped, [cnn_base]} =
+  cnn_base |> Axon.pop_node()
+
+cnn_params =
+  Map.drop(
+    mn_2_7_params,
+    [
+      "mobilenetv20_output_flatten0_reshape0",
+      "mobilenetv20_output_pred_fwd"
+    ]
+  )
+```
+
+```elixir
+# freeze deprecrated in favor of ModelState.freeze. This block is attempt to use newer route.
+# Unclear to me if what is below works. Given no frozen params in struct after I think not.
+# After experimentation I gave up on this route and this block is remnant.
+
+mn_2_7_model_state =
+  Axon.ModelState.new(%{})
+  |> Map.put(:parameters, mn_2_7_params)
+
+    
+
+model_state = 
+  mn_2_7_model_state
+  |> Axon.ModelState.freeze(fn
+    ["mobilenetv20_output" <> _, _] ->
+      false
+
+    _ ->
+      true
+  end)
+
+model_state.frozen_parameters
+```
+
+```elixir
+cnn_base = cnn_base |> Axon.freeze()
+```
+
+The output shape of the model at this point is {batch_size, 1280, 1, 1}, so you need to flatten the features before passing them to a classification head. You can flatten the features using Axon.flatten/2, or you can use a global pooling layer. Because the amount of output features in this model is relatively large, a global pooling layer works better because it reduces the amount of input features to the classification head. Additionally, you’ll want to add some regularization by using a dropout layer between your global average pooling and classification head.
+
+```elixir
+model =   
+  cnn_base   
+  |> Axon.global_avg_pool(channels: :first)   
+  |> Axon.dropout(rate: 0.2)  
+  |> Axon.dense(1)
 
 ```
 
 ```elixir
-Axon.Display.as_graph(cnn_base, input_template)
+loss =
+  &Axon.Losses.binary_cross_entropy(&1, &2,
+    reduction: :mean,
+    from_logits: true
+  )
+
+optimizer = Polaris.Optimizers.adam(learning_rate: 1.0e-4)
+
+trained_model_state =
+  model
+  |> Axon.Loop.trainer(loss, optimizer)
+  |> Axon.Loop.metric(:accuracy)
+  |> Axon.Loop.validate(model, val_pipeline)
+  |> Axon.Loop.early_stop("validation_loss", mode: :min, patience: 5)
+  |> Axon.Loop.run(
+    train_pipeline,
+    cnn_params,
+    epochs: 1,
+    compiler: EXLA
+  )
+```
+
+```elixir
+eval_model =
+  model
+  |> Axon.sigmoid()
+
+eval_model
+|> Axon.Loop.evaluator()
+|> Axon.Loop.metric(:accuracy)
+|> Axon.Loop.run(test_pipeline, trained_model_state, compiler: EXLA)
+```
+
+## Fine Tuning
+
+```elixir
+Map.keys(mn_2_7_params) |> length()
+```
+
+```elixir
+# freeze top most layers. This is roughly half of the model's layers.
+model = model |> Axon.unfreeze(up: 50)
+
+```
+
+```elixir
+loss =
+  &Axon.Losses.binary_cross_entropy(&1, &2,
+    reduction: :mean,
+    from_logits: true
+  )
+
+optimizer = Polaris.Optimizers.rmsprop(learning_rate: 1.0e-5)
+
+trained_model_state =
+  model
+  |> Axon.Loop.trainer(loss, optimizer)
+  |> Axon.Loop.metric(:accuracy)
+  |> Axon.Loop.validate(model, val_pipeline)
+  |> Axon.Loop.early_stop("
+    validation_loss",
+    mode: :min,
+    patience: 5
+  )
+  |> Axon.Loop.run(
+    train_pipeline,
+    trained_model_state,
+    epochs: 100,
+    compiler: EXLA
+  )
+```
+
+```elixir
+eval_model =
+  model
+  |> Axon.sigmoid()
+
+eval_model
+|> Axon.Loop.evaluator()
+|> Axon.Loop.metric(:accuracy)
+|> Axon.Loop.run(test_pipeline, trained_model_state, compiler: EXLA)
 ```
