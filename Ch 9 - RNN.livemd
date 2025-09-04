@@ -3,7 +3,7 @@
 ```elixir
 Mix.install([
   {:scidata, "~> 0.1"},
-  {:axon, "~> 0.5"},
+  {:axon, "~> 0.7"},
   {:exla, "~> 0.6"},
   {:nx, "~> 0.6"},
   {:table_rex, "~> 3.1.1"},
@@ -146,6 +146,33 @@ test_pipeline =
 Enum.take(train_pipeline, 1)
 ```
 
+```elixir
+train = fn (model, epochs) ->
+  loss =
+    &Axon.Losses.binary_cross_entropy(&1, &2,
+      from_logits: true,
+      reduction: :mean
+    )
+
+  optimizer = Polaris.Optimizers.adam(learning_rate: 1.0e-4)
+
+    model
+    |> Axon.Loop.trainer(loss, optimizer)
+    |> Axon.Loop.metric(:accuracy)
+    |> Axon.Loop.run(train_pipeline, %{}, epochs: epochs, compiler: EXLA)
+end
+```
+
+```elixir
+evaluate = fn (model, trained_state) -> 
+model
+|> Axon.Loop.evaluator()
+|> Axon.Loop.metric(:accuracy)
+|> Axon.Loop.run(test_pipeline, trained_state, compiler: EXLA)
+  
+end
+```
+
 <!-- livebook:{"branch_parent_index":2} -->
 
 ## MLP as benchmark
@@ -167,26 +194,191 @@ Axon.Display.as_graph(mlp_model, input_template)
 ```
 
 ```elixir
-loss = &Axon.Losses.binary_cross_entropy(&1, &2,   
-  from_logits: true,   
-  reduction: :mean   
-)   
-    
-optimizer = Polaris.Optimizers.adam(learning_rate: 1.0e-4)     
-  mlp_trained_model_state =   
-    mlp_model   
-    |> Axon.Loop.trainer(loss, optimizer)   
-    |> Axon.Loop.metric(:accuracy)   
-    |> Axon.Loop.run(train_pipeline, %{}, epochs: 10, compiler: EXLA)
+mlp_trained_model_state =   
+  train.(mlp_model, 10)
+   
 ```
 
 ```elixir
-mlp_model
-|> Axon.Loop.evaluator()
-|> Axon.Loop.metric(:accuracy)
-|> Axon.Loop.run(test_pipeline, mlp_trained_model_state, compiler: EXLA)
+evaluate.(mlp_model, mlp_trained_model_state)
 ```
 
 <!-- livebook:{"branch_parent_index":2} -->
 
 ## RNN
+
+```elixir
+sequence = Axon.input("review")
+embedded = sequence |> Axon.embedding(num_tokens + 2, 64)
+# ignore padding tokens
+mask = Axon.mask(sequence, 0)
+
+{rnn_sequence, _state} =
+  Axon.lstm(
+    embedded,
+    64,
+    mask: mask,
+    unroll: :static
+  )
+
+# extract final token from rnn sequence
+final_token = Axon.nx(rnn_sequence, fn seq ->
+  Nx.squeeze(seq[[0..-1//1, -1, 0..-1//1]])
+end)
+```
+
+`Axon.nx/3` allows you to utilize generic Nx functions as Axon layers. In this code, you use `Nx.slice_along_axis/4` to grab the final token—at index `max_seq_len - 1`—from axis 1, the temporal axis.
+
+```elixir
+rnn_model =
+  final_token
+  |> Axon.dense(64, activation: :relu)
+  |> Axon.dense(1)
+```
+
+```elixir
+input_template = Nx.template({64, 64}, :s64)
+Axon.Display.as_graph(rnn_model, input_template)
+```
+
+```elixir
+rnn_trained_model_state = train.(rnn_model, 10)
+```
+
+```elixir
+evaluate.(rnn_model, rnn_trained_model_state)
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Bidirectional RNN
+
+Note that this is fairly similar to the RNN above but makes use of the convenience function `Axon.bidirectional/3`.
+
+```elixir
+sequence = Axon.input("review")
+mask = Axon.mask(sequence, 0)
+embedded = Axon.embedding(sequence, num_tokens + 2, 64)
+
+#  {rnn_sequence, _state} = 
+rnn_sequence =
+  Axon.bidirectional(
+    embedded,
+    &Axon.lstm(
+      &1,
+      64,
+      mask: mask,
+      unroll: :static
+    ),
+    # how to join the result from each direction together
+    &Axon.concatenate/2,
+    axis: 1
+  )
+
+
+IO.inspect(match?({_forward_out, _backward_out}, rnn_sequence))
+IO.inspect(match?(%Axon{}, rnn_sequence))
+
+
+# extract final token from rnn sequence
+final_token =
+  Axon.nx(rnn_sequence, fn seq ->
+    Nx.squeeze(seq[[0..-1//1, -1, 0..-1//1]])
+  end)
+
+
+```
+
+```elixir
+bidir_rnn_model =
+  final_token
+  |> Axon.dense(64, activation: :relu)
+  |> Axon.dense(1)
+```
+
+```elixir
+
+input_template = Nx.template({64, 64}, :s64)
+Axon.Display.as_graph(bidir_rnn_model, input_template)
+```
+
+```elixir
+bidir_rnn_trained_model_state =   
+  train.(bidir_rnn_model, 10)
+```
+
+```elixir
+evaluate.(bidir_rnn_model, bidir_rnn_trained_model_state)
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## Bidirectional handrolled
+
+I can't get the section above to compile. So trying a handrolled bidirectional implementation.
+
+```elixir
+input_l = Axon.input("review")
+mask = Axon.mask(input_l, 0)
+forward_sequence = Axon.embedding(input_l, num_tokens + 2, 64)
+```
+
+```elixir
+backward_sequence =
+  Axon.nx(forward_sequence, &Nx.reverse(&1, axes: [1]))
+```
+
+```elixir
+
+{forward_state, {_f_cell, _f_hidden}} = Axon.lstm(forward_sequence, 64)
+{backward_state, {_b_cell, _b_hidden}} = Axon.lstm(backward_sequence, 64)
+```
+
+```elixir
+
+out_state =
+  Axon.add(
+    forward_state,
+    Axon.nx(backward_state, &Nx.reverse(&1, axes: [1]))
+  )
+# Minor optimisation experiments commented out below
+# out_state =
+#   Axon.concatenate(
+#     forward_state,
+#     Axon.nx(backward_state, &Nx.reverse(&1, axes: [1]))
+#   )
+# out_state =
+#   Axon.concatenate(
+#     backward_state,
+#     Axon.nx(forward_state, &Nx.reverse(&1, axes: [1]))
+#   )
+
+
+# extract final token from rnn sequence
+final_token =
+  Axon.nx(out_state, fn seq ->
+    Nx.squeeze(seq[[0..-1//1, -1, 0..-1//1]])
+  end)
+```
+
+```elixir
+hrolled_bidir_model =
+  final_token
+  |> Axon.dense(64, activation: :relu)
+  |> Axon.dense(1)
+```
+
+```elixir
+input_template = Nx.template({64, 64}, :s64)
+Axon.Display.as_graph(hrolled_bidir_model, input_template)
+```
+
+```elixir
+hrolled_bidir_trained_model_state =   
+  train.(hrolled_bidir_model, 10)
+```
+
+```elixir
+evaluate.(hrolled_bidir_model, hrolled_bidir_trained_model_state)
+
+```
