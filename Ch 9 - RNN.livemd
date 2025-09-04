@@ -1,0 +1,192 @@
+# Ch 9: RNNs
+
+```elixir
+Mix.install([
+  {:scidata, "~> 0.1"},
+  {:axon, "~> 0.5"},
+  {:exla, "~> 0.6"},
+  {:nx, "~> 0.6"},
+  {:table_rex, "~> 3.1.1"},
+  {:kino, "~> 0.7"}
+])
+
+Nx.default_backend(EXLA.Backend)
+```
+
+## Get data
+
+```elixir
+data = Scidata.IMDBReviews.download()
+```
+
+```elixir
+{train_data, test_data} =
+  data.review
+  |> Enum.zip(data.sentiment)
+  |> Enum.shuffle()
+  |> Enum.split(23_000)
+```
+
+## Tokenising
+
+Let's have a peek at our data and a potential tokenising strategy: normalise by downcasing and stripping punctuation. Splitting on whitespace.
+
+Not suitable for everything but fits acceptably to problem scenario.
+
+```elixir
+{review, _sentiment} = train_data |> hd()
+
+normalise = fn (review) ->
+review
+|> String.downcase()
+# remove punctuation and symbols
+|> String.replace(~r/[\p{P}\p{S}]/, "")
+|> String.split()
+end
+
+normalise.(review)
+
+
+```
+
+We'll use a sparse representation by mapping words to an index. To do this we'll map the most frequent words to avoid vocabulary bloat, i.e. a ginormous index.
+
+```elixir
+frequencies =
+  Enum.reduce(train_data, %{}, fn {review, _}, tokens -> 
+    review 
+    |> normalise.()
+    |> Enum.reduce(tokens, &Map.update(&2, &1, 1, fn x -> x + 1 end))
+    end)
+```
+
+```elixir
+# num_tokens is arbitrary limit
+num_tokens = 1024
+
+tokens =
+  frequencies
+  |> Enum.sort_by(&elem(&1, 1), :desc)
+  |> Enum.take(num_tokens)
+```
+
+```elixir
+tokens =
+  tokens
+  |> Enum.with_index(fn {token, _}, i -> {token, i + 2} end)
+  |> Map.new()
+```
+
+**Note we've started indexing from 2**. The 0 and 1 indexes are unassigned. These are for
+
+1. a padding token
+
+   Nx requires static shapes and doesn’t support ragged tensors\* (tensors of non-uniform dimensions), so you need a strategy to convert all of your input reviews to a uniform shape. The most common way to do this is by padding or truncating each sequence to a fixed length.
+
+2. the OOV tokens (as a category)
+
+   We need to account for the words that'll fall outside this vocabulary, out-of-vocab(OOV) tokens.
+
+\*Some frameworks support working with ragged tensors.
+
+```elixir
+Enum.find(tokens, "No zero or one index found", fn {_t,i} -> i == 0 or i == 1 end )
+```
+
+Now we have an indexed vocab.
+
+Next we'll write a tokeniser function. Note the replacement of OOV tokens with the 0 index.
+
+```elixir
+pad_token = 0
+unknown_token = 1
+
+max_seq_len = 64
+
+tokenize = fn review ->   
+  review   
+  |> normalise.()
+  |> Enum.map(&Map.get(tokens, &1, unknown_token))   
+  |> Nx.tensor()
+  |> then(&Nx.pad(&1, pad_token, [{0, max_seq_len - Nx.size(&1), 0}]))
+  end     
+  
+tokenize.(review)
+```
+
+## Input pipeline
+
+```elixir
+batch_size = 64
+
+train_pipeline =
+  train_data
+  |> Stream.map(fn {review, label} ->
+    {tokenize.(review), Nx.tensor(label)}
+  end)
+  |> Stream.chunk_every(batch_size, batch_size, :discard)
+  |> Stream.map(fn reviews_and_labels ->
+    {review, label} = Enum.unzip(reviews_and_labels)
+    {Nx.stack(review), Nx.stack(label) |> Nx.new_axis(-1)}
+  end)
+
+test_pipeline =
+  test_data
+  |> Stream.map(fn {review, label} ->
+    {tokenize.(review), Nx.tensor(label)}
+  end)
+  |> Stream.chunk_every(batch_size, batch_size, :discard)
+  |> Stream.map(fn reviews_and_labels ->
+    {review, label} = Enum.unzip(reviews_and_labels)
+    {Nx.stack(review), Nx.stack(label) |> Nx.new_axis(-1)}
+  end)
+```
+
+```elixir
+Enum.take(train_pipeline, 1)
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## MLP as benchmark
+
+```elixir
+mlp_model =
+  Axon.input("review")
+  |> Axon.embedding(num_tokens + 2, 64)
+  |> Axon.flatten()
+  |> Axon.dense(64, activation: :relu)
+  |> Axon.dense(1)
+```
+
+`Axon.embedding/3` takes a sparse collection of tokens like the ones you have in each of your sequences and maps them to a dense vector representation.
+
+```elixir
+input_template = Nx.template({64, 64}, :s64)
+Axon.Display.as_graph(mlp_model, input_template)
+```
+
+```elixir
+loss = &Axon.Losses.binary_cross_entropy(&1, &2,   
+  from_logits: true,   
+  reduction: :mean   
+)   
+    
+optimizer = Polaris.Optimizers.adam(learning_rate: 1.0e-4)     
+  mlp_trained_model_state =   
+    mlp_model   
+    |> Axon.Loop.trainer(loss, optimizer)   
+    |> Axon.Loop.metric(:accuracy)   
+    |> Axon.Loop.run(train_pipeline, %{}, epochs: 10, compiler: EXLA)
+```
+
+```elixir
+mlp_model
+|> Axon.Loop.evaluator()
+|> Axon.Loop.metric(:accuracy)
+|> Axon.Loop.run(test_pipeline, mlp_trained_model_state, compiler: EXLA)
+```
+
+<!-- livebook:{"branch_parent_index":2} -->
+
+## RNN
