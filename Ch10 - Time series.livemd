@@ -166,6 +166,83 @@ single_step_test_data =
 Enum.take(single_step_train_data, 1)
 ```
 
+```elixir
+train = fn (model, epochs, optimizer, loss, metrics) ->
+    model
+    |> Axon.Loop.trainer(loss, optimizer)
+    |> Axon.Loop.metric(metrics)
+    |> Axon.Loop.run(single_step_train_data, %{}, epochs: epochs, compiler: EXLA)
+end
+
+evaluate = fn (model, trained_state, metrics) -> 
+model
+|> Axon.Loop.evaluator()
+|> Axon.Loop.metric(metrics)
+|> Axon.Loop.run(single_step_test_data, trained_state, compiler: EXLA)
+  
+end
+```
+
+```elixir
+defmodule Analysis do
+  def visualize_predictions(
+        model,
+        model_state,
+        prices,
+        window_size,
+        target_window_size,
+        batch_size
+      ) do
+    {_, predict_fn} = Axon.build(model, compiler: EXLA)
+
+    windows =
+      prices
+      |> Data.window(window_size, target_window_size)
+      |> Data.batch(batch_size)
+      |> Stream.map(&elem(&1, 0))
+
+    predicted =
+      Enum.flat_map(windows, fn window ->
+        predict_fn.(model_state, window)
+        |> Nx.to_flat_list()
+      end)
+
+    predicted = List.duplicate(nil, 10) ++ predicted
+
+    types =
+      List.duplicate("AAPL", length(prices)) ++
+        List.duplicate("Predicted", length(prices))
+
+    days =
+      Enum.to_list(0..(length(prices) - 1)) ++
+        Enum.to_list(0..(length(prices) - 1))
+
+    prices = prices ++ predicted
+
+    plot(
+      %{
+        "day" => days,
+        "prices" => prices,
+        "types" => types
+      },
+      "AAPL Stock Price vs. Predicted, CNN Single-Shot"
+    )
+
+    predicted
+  end
+
+  defp plot(values, title) do
+    Vl.new(title: title, width: 640, height: 480)
+    |> Vl.data_from_values(values)
+    |> Vl.mark(:line)
+    |> Vl.encode_field(:x, "day", type: :temporal)
+    |> Vl.encode_field(:y, "prices", type: :quantitative)
+    |> Vl.encode_field(:color, "types", type: :nominal)
+    |> Kino.VegaLite.new()
+  end
+end
+```
+
 ## CNN for single step prediction
 
 ```elixir
@@ -180,23 +257,6 @@ cnn_model =
 ```elixir
 template = Nx.template({32, 10, 1}, :f32)
 Axon.Display.as_graph(cnn_model, template)
-```
-
-```elixir
-train = fn (model, epochs, optimizer, loss, metrics) ->
-    model
-    |> Axon.Loop.trainer(loss, optimizer)
-    |> Axon.Loop.metric(metrics)
-    |> Axon.Loop.run(single_step_train_data, %{}, epochs: epochs, compiler: EXLA)
-end
-
-evaluate = fn (model, trained_state, metrics) -> 
-model
-|> Axon.Loop.evaluator()
-|> Axon.Loop.metric(metrics)
-|> Axon.Loop.run(single_step_train_data, trained_state, compiler: EXLA)
-  
-end
 ```
 
 ```elixir
@@ -227,4 +287,74 @@ The denormalised error is #{error}.
 You can interpret the result as meaning that over the course of two years, 
 your model had an absolute error of $#{Float.round(error, 2)} off the next day’s closing stock price across each batch.
 """)
+```
+
+```elixir
+Analysis.visualize_predictions(
+  cnn_model,
+  cnn_trained_model_state,
+  Explorer.Series.to_list(aapl_df["Close"]),
+  window_size,
+  1,
+  batch_size
+)
+```
+
+<!-- livebook:{"branch_parent_index":1} -->
+
+## RNN for time series
+
+```elixir
+rnn_model =
+  Axon.input("stock_prices")
+  |> Axon.lstm(32)
+  |> elem(0)
+  |> Axon.nx(& &1[[0..-1//1, -1, 0..-1//1]])
+  |> Axon.dense(1)
+```
+
+```elixir
+template = Nx.template({32, 10, 1}, :f32)
+Axon.Display.as_graph(rnn_model, template)
+```
+
+```elixir
+rnn_trained_state =
+  train.(rnn_model, 30, :adam, :mean_squared_error, :mean_absolute_error)
+```
+
+```elixir
+variance = Explorer.Series.variance(df["Close"])
+mean = Explorer.Series.mean(df["Close"])
+
+denormalise = fn %{0 => error_map} ->
+  error_map
+  |> Map.get("mean_absolute_error")
+  |> Nx.to_number()
+  |> Kernel.*(:math.sqrt(variance))
+  |> Kernel.+(mean)
+end
+
+error = evaluate.(rnn_model, rnn_trained_state, :mean_absolute_error)
+|> IO.inspect()
+|> denormalise.()
+
+IO.puts("""
+
+The denormalised error is #{error}. 
+
+You can interpret the result as meaning that over the course of two years, 
+your model had an absolute error of $#{Float.round(error, 2)} off the next day’s closing stock price across each batch.
+""")
+```
+
+```elixir
+Analysis.visualize_predictions(
+  rnn_model,
+  rnn_trained_state,
+  Explorer.Series.to_list(aapl_df["Close"]),
+  window_size,
+  1,
+  batch_size
+)
 ```
