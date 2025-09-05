@@ -1,0 +1,167 @@
+# Ch 10: RNNs for time series
+
+```elixir
+Mix.install([
+  {:explorer, "~> 0.7.0"},
+  {:nx, "~> 0.6"},
+  {:exla, "~> 0.6"},
+  {:axon, "~> 0.5"},
+  {:vega_lite, "~> 0.1.6"},
+  {:kino, "~> 0.8.0"},
+  {:kino_vega_lite, "~> 0.1.7"}
+])
+
+alias VegaLite, as: Vl
+alias Explorer.DataFrame, as: Df
+```
+
+## Exploring the data
+
+```elixir
+base_path = "Dev/Education/Elixir/ml/Datasets/"
+csv_file = "stocks/all_stocks_2006-01-01_to_2018-01-01.csv"
+df = Df.from_csv!(base_path <> csv_file, parse_dates: true)
+```
+
+```elixir
+df.names |> IO.inspect()
+
+df = Df.select(df, ["Date", "Close", "Name"])
+
+```
+
+```elixir
+# Just taking a look at what to_columns does
+Explorer.DataFrame.to_columns(df)
+```
+
+```elixir
+mk_graph = fn df, title -> 
+  Vl.new(title: title, width: 640, height: 480)
+|> Vl.data_from_values(Explorer.DataFrame.to_columns(df))
+|> Vl.mark(:line)
+|> Vl.encode_field(:x, "Date", type: :temporal)
+|> Vl.encode_field(:y, "Close", type: :quantitative)
+|> Vl.encode_field(:color, "Name", type: :nominal)
+|> Kino.VegaLite.new()
+end
+
+mk_graph.(df, "DJIA Stock Prices")
+```
+
+We’re only concerned with the price of the AAPL stock, so we can filter the data accordingly:
+
+```elixir
+aapl_df = Df.filter_with(df, fn df -> 
+  Explorer.Series.equal(df["Name"], "AAPL")
+end)
+```
+
+```elixir
+mk_graph.(aapl_df, "AAPL Stock Prices")
+```
+
+## Prep data
+
+```elixir
+normalized_aapl_df =
+  Df.mutate_with(aapl_df, fn df ->
+    var = Explorer.Series.variance(df["Close"])
+    mean = Explorer.Series.mean(df["Close"])
+    centered = Explorer.Series.subtract(df["Close"], mean)
+    norm = Explorer.Series.divide(centered, var)
+    [Close: norm]
+  end)
+
+# get a sense of range
+min = Explorer.Series.min(normalized_aapl_df["Close"])
+max = Explorer.Series.max(normalized_aapl_df["Close"])
+IO.inspect({min, max})
+
+mk_graph.(normalized_aapl_df, "AAPL normalised stock price")
+```
+
+```elixir
+defmodule Data do
+  @spec window(
+          inputs :: Enumerable.t(),
+          window_size :: non_neg_integer(),
+          target_window_size :: non_neg_integer()
+        ) :: Enumerable.t({Enumerable.t(), Enumerable.t()})
+
+  def window(inputs, window_size, target_window_size) do
+    inputs
+    |> Stream.chunk_every(window_size + target_window_size, 1, :discard)
+    |> Stream.map(fn window ->
+      features =
+        window
+        |> Enum.take(window_size)
+        |> Nx.tensor()
+        |> Nx.new_axis(1)
+
+      targets =
+        window
+        |> Enum.drop(window_size)
+        |> Nx.tensor()
+        |> Nx.new_axis(1)
+
+      {features, targets}
+    end)
+  end
+
+  @spec batch(
+          inputs :: Enumerable.t({Enumerable.t(), Enumerable.t()}),
+          batch_size :: non_neg_integer()
+        ) :: Enumerable.t({any(), any()})
+  def batch(inputs, batch_size) do
+    inputs
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn windows ->
+      {features, targets} = Enum.unzip(windows)
+      {Nx.stack(features), Nx.stack(targets)}
+    end)
+  end
+end
+```
+
+```elixir
+train_df =
+  Explorer.DataFrame.filter_with(normalized_aapl_df, fn df ->
+    Explorer.Series.less(df["Date"], Date.new!(2016, 1, 1))
+  end)
+
+test_df =
+  Explorer.DataFrame.filter_with(normalized_aapl_df, fn df ->
+    Explorer.Series.greater_equal(df["Date"], Date.new!(2016, 1, 1))
+  end)
+```
+
+```elixir
+window_size = 5
+batch_size = 32
+
+train_prices = Explorer.Series.to_list(train_df["Close"])
+test_prices = Explorer.Series.to_list(test_df["Close"])
+
+single_step_train_data =
+  train_prices
+  |> Data.window(window_size, 1)
+  # [
+  #   {#Nx.Tensor<f32[5][1]>,
+  #    #Nx.Tensor<f32[1][1]>}
+  # ...]
+  |> Data.batch(batch_size)
+# [
+#   {#Nx.Tensor<f32[32][5][1]>,
+#   #Nx.Tensor<f32[32][1][1]>}
+# ...]
+
+single_step_test_data =
+  test_prices
+  |> Data.window(window_size, 1)
+  |> Data.batch(batch_size)
+```
+
+```elixir
+Enum.take(single_step_train_data, 1)
+```
