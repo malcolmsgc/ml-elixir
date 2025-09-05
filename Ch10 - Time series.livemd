@@ -165,3 +165,66 @@ single_step_test_data =
 ```elixir
 Enum.take(single_step_train_data, 1)
 ```
+
+## CNN for single step prediction
+
+```elixir
+cnn_model =   
+  Axon.input("stock_price")   
+  |> Axon.nx(&Nx.new_axis(&1, -1))   
+  |> Axon.conv(32, kernel_size: {window_size, 1}, activation: :relu)   
+  |> Axon.dense(32, activation: :relu)   
+  |> Axon.dense(1)
+```
+
+```elixir
+template = Nx.template({32, 10, 1}, :f32)
+Axon.Display.as_graph(cnn_model, template)
+```
+
+```elixir
+train = fn (model, epochs, optimizer, loss, metrics) ->
+    model
+    |> Axon.Loop.trainer(loss, optimizer)
+    |> Axon.Loop.metric(metrics)
+    |> Axon.Loop.run(single_step_train_data, %{}, epochs: epochs, compiler: EXLA)
+end
+
+evaluate = fn (model, trained_state, metrics) -> 
+model
+|> Axon.Loop.evaluator()
+|> Axon.Loop.metric(metrics)
+|> Axon.Loop.run(single_step_train_data, trained_state, compiler: EXLA)
+  
+end
+```
+
+```elixir
+cnn_trained_model_state =
+  train.(cnn_model, 10, :adam, :mean_squared_error, :mean_absolute_error)
+```
+
+```elixir
+variance = Explorer.Series.variance(df["Close"])
+mean = Explorer.Series.mean(df["Close"])
+
+denormalise = fn %{0 => error_map} ->
+  error_map
+  |> Map.get("mean_absolute_error")
+  |> Nx.to_number()
+  |> Kernel.*(:math.sqrt(variance))
+  |> Kernel.+(mean)
+end
+
+error = evaluate.(cnn_model, cnn_trained_model_state, :mean_absolute_error)
+|> IO.inspect()
+|> denormalise.()
+
+IO.puts("""
+
+The denormalised error is #{error}. 
+
+You can interpret the result as meaning that over the course of two years, 
+your model had an absolute error of $#{Float.round(error, 2)} off the next day’s closing stock price across each batch.
+""")
+```
