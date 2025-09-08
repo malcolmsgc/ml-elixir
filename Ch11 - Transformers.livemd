@@ -1,0 +1,263 @@
+# Ch11: Transformers
+
+```elixir
+Mix.install([
+  {:bumblebee, "~> 0.5"},
+  {:axon, "~> 0.6"},
+  {:nx, "~> 0.7"},
+  {:kino, "~> 0.8"},
+  {:kino_bumblebee, ">= 0.0.0"},
+  {:exla, ">= 0.0.0"}
+])
+
+
+
+```
+
+## Document Root
+
+```elixir
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## Zero-shot classification
+
+```elixir
+{:ok, model_map} =
+  Bumblebee.load_model({:hf, "facebook/bart-large-mnli"})
+
+{:ok, tokenizer} =
+  Bumblebee.load_tokenizer({:hf, "facebook/bart-large-mnli"})
+
+%{model: model, spec: spec, params: params} = model_map
+```
+
+```elixir
+IO.inspect(model)
+```
+
+```elixir
+labels = ["New booking", "Update booking", "Cancel booking", "Refund", "General query"]     
+urgency = ["High urgency", "Medium urgency", "Low urgency"]
+
+
+zero_shot_serving =   
+  Bumblebee.Text.zero_shot_classification(   
+    model_map,   
+    tokenizer,   
+    labels   
+  )
+
+zero_shot_serving_urgency =   
+  Bumblebee.Text.zero_shot_classification(   
+    model_map,   
+    tokenizer,   
+    urgency   
+  )
+```
+
+```elixir
+input = "I need to book a new flight"
+Nx.Serving.run(zero_shot_serving, input)
+|> IO.inspect()
+
+inputs = [
+  "I want to change my existing flight",
+  "I want to cancel my current flight",
+  "I demand my money back",
+  "I've missed my connection",
+  "What time does flight BA562 land?"
+]
+
+Nx.Serving.run(zero_shot_serving, inputs)
+|> IO.inspect()
+
+
+Nx.Serving.run(zero_shot_serving_urgency, inputs)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Sentence completion
+
+```elixir
+# repo = {:hf, "unsloth/gemma-7b-it"}
+repo = {:hf, "openai-community/gpt2"}
+{:ok, model} = Bumblebee.load_model(repo)
+{:ok, tokenizer} = Bumblebee.load_tokenizer(repo)
+{:ok, generation_config} = Bumblebee.load_generation_config(repo)
+
+generation_config =
+  Bumblebee.configure(generation_config,
+    max_new_tokens: 256,
+    strategy: %{type: :multinomial_sampling, top_p: 0.6}
+  )
+```
+
+```elixir
+serving =   
+  Bumblebee.Text.generation(   
+    model,   
+    tokenizer,   
+    generation_config,   
+    compile: [batch_size: 1, sequence_length: 1028],  
+    stream: true,   
+    defn_options: [compiler: EXLA]   
+  )
+
+Kino.start_child({Nx.Serving, name: Gpt2, serving: serving})
+
+```
+
+```elixir
+user_input = Kino.Input.text("User prompt", default: "Who are you?")
+```
+
+```elixir
+
+text = Kino.Input.read(user_input)
+
+  
+prompt = """
+#{text}   
+"""
+  
+
+Nx.Serving.batched_run(Gpt2, prompt)
+|> Enum.each(&IO.write/1)
+
+
+
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Vision
+
+```elixir
+{:ok, model_info} =
+  Bumblebee.load_model({:hf, "google/vit-base-patch16-224"})
+
+{:ok, featurizer} = Bumblebee.load_featurizer({:hf, "google/vit-base-patch16-224"})
+
+serving =
+  Bumblebee.Vision.image_classification(model_info, featurizer,
+    top_k: 1,
+    compile: [batch_size: 1],
+    defn_options: [compiler: EXLA]
+  )
+```
+
+```elixir
+image_input = Kino.Input.image("Image", size: {224, 224})
+form = Kino.Control.form([image: image_input], submit: "Run")
+frame = Kino.Frame.new()
+
+form
+|> Kino.Control.stream()
+|> Stream.filter(& &1.data.image)
+|> Kino.listen(fn %{data: %{image: image}} ->
+  Kino.Frame.render(frame, Kino.Markdown.new("Running..."))
+
+  image =
+    image.file_ref
+    |> Kino.Input.file_path()
+    |> File.read!()
+    |> Nx.from_binary(:u8)
+    |> Nx.reshape({image.height, image.width, 3})
+
+  output = Nx.Serving.run(serving, image)
+
+  output.predictions
+  |> Enum.map(&{&1.label, &1.score})
+  |> Kino.Bumblebee.ScoredList.new()
+  |> then(&Kino.Frame.render(frame, &1))
+end)
+
+Kino.Layout.grid([form, frame], boxed: true, gap: 16)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Fine tune
+
+```elixir
+{:ok, spec} =
+  Bumblebee.load_spec({:hf, "distilbert-base-cased"},
+    module: Bumblebee.Text.Distilbert,
+    architecture: :for_sequence_classification
+  )
+
+spec = Bumblebee.configure(spec, num_labels: 5)
+
+{:ok, %{model: model, params: params}} =
+  Bumblebee.load_model(
+    {:hf, "distilbert-base-cased"},
+    spec: spec
+  )
+
+{:ok, tokenizer} = Bumblebee.load_tokenizer(
+  {:hf, "distilbert-base-cased"}
+)
+```
+
+```elixir
+batch_size = 32
+max_length = 128
+base_path = "Dev/Education/Elixir/ml/Datasets/"
+
+train_data =
+  File.stream!(base_path <> "yelp_review_full_csv/train.csv")
+  |> Stream.chunk_every(batch_size)
+  |> Stream.map(fn inputs ->
+    {labels, reviews} =
+      inputs
+      |> Enum.map(fn line ->
+        [label, review] = String.split(line, "\",\"")
+        {String.trim(label, "\""), String.trim(review, "\"")}
+      end)
+      |> Enum.unzip()
+
+    labels = labels |> Enum.map(&String.to_integer/1) |> Nx.tensor()
+    tokens = Bumblebee.apply_tokenizer(tokenizer, reviews, length: max_length)
+    {tokens, labels}
+  end)
+```
+
+```elixir
+Enum.take(train_data, 1)
+```
+
+The model output is a map consisting of `:attentions`, `:hidden_states`, and `:logits`.
+
+```elixir
+Axon.get_output_shape(model, %{"input_ids" => Nx.template({32, 128}, :s64)})
+```
+
+```elixir
+model = Axon.nx(model, fn %{logits: logits} -> logits end)
+```
+
+```elixir
+optimizer = Polaris.Optimizers.adamw(learning_rate: 5.0e-5)
+
+loss =
+  &Axon.Losses.categorical_cross_entropy(&1, &2,
+    from_logits: true,
+    sparse: true,
+    reduction: :mean
+  )
+
+trained_model_state =
+  model
+  |> Axon.Loop.trainer(loss, optimizer, log: 1)
+  |> Axon.Loop.metric(:accuracy)
+  |> Axon.Loop.run(train_data, params, epochs: 3, compiler: EXLA)
+```
+
+```elixir
+model   
+|> Axon.Loop.evaluator()  
+|> Axon.Loop.metric(:accuracy) 
+|> Axon.Loop.run(test_data, params, compiler: EXLA)
+```
