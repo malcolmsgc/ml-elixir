@@ -130,3 +130,233 @@ Kino.Image.new(out_image)
 > Unfortunately, you didn’t force your model to have a latent space with structure. The structure of your encoded representations is at the mercy of a neural network and gradient descent. You can’t pass random uniform or normal noise to your decoder and expect coherent output because your decoder only knows how to handle latent representations produced by the encoder. But what if there was a way to force your encoder to learn a structured representation, which you can easily query later on? Fortunately, there is. Enter the variational autoencoder.
 
 ## Variational autoencoder
+
+```elixir
+defmodule VAE do
+  import Nx.Defn
+
+  def encoder(input) do
+    encoded =
+      input
+      |> Axon.conv(32,
+        kernel_size: 3,
+        activation: :relu,
+        strides: 2,
+        padding: :same
+      )
+      |> Axon.conv(32,
+        kernel_size: 3,
+        activation: :relu,
+        strides: 2,
+        padding: :same
+      )
+      |> Axon.flatten()
+      |> Axon.dense(16, activation: :relu)
+
+    z_mean = Axon.dense(encoded, 2)
+    z_log_var = Axon.dense(encoded, 2)
+    z = Axon.layer(&sample/3, [z_mean, z_log_var], op_name: :sample)
+    Axon.container({z_mean, z_log_var, z})
+  end
+
+  defnp sample(z_mean, z_log_var, _opts \\ []) do
+    noise_shape = Nx.shape(z_mean)
+    # Nx.random_normal removed from lib in 0.7
+    # epsilon = Nx.random_normal(noise_shape)
+    key = Nx.Random.key(42)
+    {epsilon, _} = Nx.Random.normal(key, shape: noise_shape)
+    z_mean + Nx.exp(0.5 * z_log_var) * epsilon
+  end
+
+  def decoder(input) do
+    input
+    |> Axon.dense(7 * 7 * 64, activation: :relu)
+    |> Axon.reshape({:batch, 7, 7, 64})
+    |> Axon.conv_transpose(64,
+      kernel_size: {3, 3},
+      activation: :relu,
+      strides: [2, 2],
+      padding: :same
+    )
+    |> Axon.conv_transpose(32,
+      kernel_size: {3, 3},
+      activation: :relu,
+      strides: [2, 2],
+      padding: :same
+    )
+    |> Axon.conv_transpose(1,
+      kernel_size: {3, 3},
+      activation: :sigmoid,
+      padding: :same
+    )
+  end
+
+  defn train_step(encoder_fn, decoder_fn, optimizer_fn, batch, state) do
+    {batch_loss, joint_param_grads} =
+      value_and_grad(
+        state[:model_state],
+        &joint_objective(encoder_fn, decoder_fn, batch, &1)
+      )
+
+    {scaled_updates, new_optimizer_state} =
+      optimizer_fn.(
+        joint_param_grads,
+        state[:optimizer_state],
+        state[:model_state]
+      )
+
+    new_model_state =
+      Axon.Updates.apply_updates(
+        state[:model_state],
+        scaled_updates
+      )
+
+    new_loss =
+      state[:loss]
+      |> Nx.multiply(state[:i])
+      |> Nx.add(batch_loss)
+      |> Nx.divide(Nx.add(state[:i], 1))
+
+    %{
+      state
+      | i: Nx.add(state[:i], 1),
+        loss: new_loss,
+        model_state: new_model_state,
+        optimizer_state: new_optimizer_state
+    }
+  end
+
+  defnp joint_objective(encoder_fn, decoder_fn, batch, joint_params) do
+    %{prediction: preds} = encoder_fn.(joint_params["encoder"], batch)
+    {z_mean, z_log_var, z} = preds
+    %{prediction: reconstruction} = decoder_fn.(joint_params["decoder"], z)
+
+    # how well your decoder reconstructs the original batch of images from the encoded representation.
+    recon_loss =
+      Axon.Losses.binary_cross_entropy(
+        batch,
+        reconstruction,
+        reduction: :mean
+      )
+
+    # Regularization which penalizes the model from drifting too far away from a normal distribution. 
+    # It basically measures the difference of the distribution defined by the given parameters 
+    #   z_mean and z_log_var from a normal distribution with mean 1 and variance 0. 
+    # This term helps coerce your encoder into learning to encode your data as a normal distribution.
+    kl_loss = -0.5 * (1 + z_log_var - Nx.pow(z_mean, 2) - Nx.exp(z_log_var))
+    kl_loss = Nx.mean(Nx.sum(kl_loss, axes: [1]))
+    recon_loss + kl_loss
+  end
+
+  defn init_step(
+         encoder_init_fn,
+         decoder_init_fn,
+         optimizer_init_fn,
+         batch,
+         init_state
+       ) do
+    encoder_params = encoder_init_fn.(batch, init_state)
+    key = Nx.Random.key(28)
+    {uniform, _} = Nx.Random.uniform(key, shape: {64, 2})
+    decoder_params = decoder_init_fn.(uniform, init_state)
+
+    joint_params = %{
+      "encoder" => encoder_params,
+      "decoder" => decoder_params
+    }
+
+    optimizer_state = optimizer_init_fn.(joint_params)
+
+    %{
+      i: Nx.tensor(0),
+      loss: Nx.tensor(0.0),
+      model_state: joint_params,
+      optimizer_state: optimizer_state
+    }
+  end
+
+  def display_sample(
+        %Axon.Loop.State{step_state: state} = out_state,
+        decoder_fn
+      ) do
+    latent = Nx.tensor([[0.0, 0.0], [0.5, 0.5], [1.0, 1.0]])
+    %{prediction: out} = decoder_fn.(state[:model_state]["decoder"], latent)
+
+    out_image =
+      Nx.multiply(out, 255)
+      |> Nx.as_type(:u8)
+
+    upsample =
+      Axon.Layers.resize(
+        out_image,
+        size: {512, 512},
+        channels: :last
+      )
+
+    for i <- 0..2 do
+      Kino.Image.new(Nx.reshape(upsample[i], {512, 512, 1}))
+      |> Kino.render()
+    end
+
+    {:continue, out_state}
+  end
+end
+
+# ** (ArgumentError) cannot reshape, current shape
+# {28, 512, 512} is not compatible with new shape {512, 512, 1}
+```
+
+```elixir
+template = Nx.template({1, 128}, :f32)
+Axon.Display.as_graph(VAE.decoder(Axon.input("latent")), template)
+```
+
+Custom training loop. This needs 2 functions defined, one for state initialisation and another for state updates between steps.
+
+These we've defined in the VAE module above as `init_step/5` and `train_step/5` respectively.
+
+```elixir
+encoder =
+  Axon.input("image")
+  |> VAE.encoder()
+
+decoder =
+  Axon.input("latent")
+  |> VAE.decoder()
+
+{encoder_init_fn, encoder_fn} = Axon.build(encoder, mode: :train)
+{decoder_init_fn, decoder_fn} = Axon.build(decoder, mode: :train)
+
+{optimizer_init_fn, optimizer_fn} = Polaris.Optimizers.adam(learning_rate: 1.0e-3)
+
+init_fn =
+  &VAE.init_step(
+    encoder_init_fn,
+    decoder_init_fn,
+    optimizer_init_fn,
+    &1,
+    &2
+  )
+
+step_fn =
+  &VAE.train_step(
+    encoder_fn,
+    decoder_fn,
+    optimizer_fn,
+    &1,
+    &2
+  )
+
+step_fn
+|> Axon.Loop.loop(init_fn)
+|> Axon.Loop.handle_event(:epoch_completed, &VAE.display_sample(&1, decoder_fn))
+|> Axon.Loop.log(
+  fn %Axon.Loop.State{epoch: epoch, iteration: iter, step_state: state} ->
+    "\rEpoch: #{epoch}, batch: #{iter}, loss: #{Nx.to_number(state[:loss])}"
+  end,
+  event: :iteration_completed,
+  device: :stdio
+)
+|> Axon.Loop.run(train_data, %{}, compiler: EXLA, epochs: 10)
+
+```
