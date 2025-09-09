@@ -10,13 +10,11 @@ Mix.install([
 ])
 ```
 
-## Root
+## Data prep
 
 ```elixir
 Nx.global_default_backend(EXLA.Backend)
 ```
-
-## Autoencoder
 
 ```elixir
 batch_size = 64
@@ -30,6 +28,8 @@ train_data =
   |> Nx.divide(255)
   |> Nx.to_batched(batch_size)
 ```
+
+## Autoencoder
 
 ```elixir
 defmodule Autoencoder do
@@ -128,6 +128,8 @@ Kino.Image.new(out_image)
 ```
 
 > Unfortunately, you didn’t force your model to have a latent space with structure. The structure of your encoded representations is at the mercy of a neural network and gradient descent. You can’t pass random uniform or normal noise to your decoder and expect coherent output because your decoder only knows how to handle latent representations produced by the encoder. But what if there was a way to force your encoder to learn a structured representation, which you can easily query later on? Fortunately, there is. Enter the variational autoencoder.
+
+<!-- livebook:{"branch_parent_index":0} -->
 
 ## Variational autoencoder
 
@@ -302,8 +304,6 @@ defmodule VAE do
   end
 end
 
-# ** (ArgumentError) cannot reshape, current shape
-# {28, 512, 512} is not compatible with new shape {512, 512, 1}
 ```
 
 ```elixir
@@ -359,4 +359,314 @@ step_fn
 )
 |> Axon.Loop.run(train_data, %{}, compiler: EXLA, epochs: 10)
 
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## GAN
+
+```elixir
+defmodule GAN do
+  import Nx.Defn
+
+  def discriminator(input) do
+    input
+    |> Axon.conv(32, activation: :mish, kernel_size: 3, strides: 2, padding: :same)
+    |> Axon.layer_norm()
+    |> Axon.conv(64, activation: :mish, kernel_size: 3, strides: 2, padding: :same)
+    |> Axon.layer_norm()
+    |> Axon.flatten()
+    |> Axon.dropout(rate: 0.5)
+    |> Axon.dense(1, activation: :sigmoid)
+  end
+
+  def generator(input) do
+    input
+    |> Axon.dense(128 * 7 * 7, activation: :mish)
+    |> Axon.reshape({:batch, 7, 7, 128})
+    |> Axon.resize({14, 14})
+    |> Axon.conv(128, kernel_size: 3, padding: :same)
+    |> Axon.layer_norm()
+    |> Axon.relu()
+    |> Axon.resize({28, 28})
+    |> Axon.conv(64, kernel_size: 3, padding: :same)
+    |> Axon.layer_norm()
+    |> Axon.relu()
+    |> Axon.conv(1, activation: :tanh, kernel_size: 3, padding: :same)
+  end
+
+  defn train_step(
+         discriminator_fn,
+         generator_fn,
+         discriminator_optimizer,
+         generator_optimizer,
+         batch,
+         state
+       ) do
+    d_params = state[:model_state]["discriminator"]
+    g_params = state[:model_state]["generator"]
+    d_optimizer_state = state[:optimizer_state]["discriminator"]
+    g_optimizer_state = state[:optimizer_state]["generator"]
+
+    # Update discriminator 
+    {d_loss, d_grads} =
+      value_and_grad(d_params, fn d_params ->
+        d_objective(
+          d_params,
+          g_params,
+          discriminator_fn,
+          generator_fn,
+          batch
+        )
+      end)
+
+    {d_updates, new_d_optimizer_state} =
+      discriminator_optimizer.(
+        d_grads,
+        d_optimizer_state,
+        d_params
+      )
+
+    new_d_params = Axon.Updates.apply_updates(d_params, d_updates)
+
+    # Update generator  
+    {g_loss, g_grads} =
+      value_and_grad(g_params, fn g_params ->
+        g_objective(
+          d_params,
+          g_params,
+          discriminator_fn,
+          generator_fn,
+          batch
+        )
+      end)
+
+    {g_updates, new_g_optimizer_state} =
+      generator_optimizer.(
+        g_grads,
+        g_optimizer_state,
+        g_params
+      )
+
+    new_g_params = Axon.Updates.apply_updates(g_params, g_updates)
+
+    # Update Losses  
+    new_d_loss =
+      state[:loss]["discriminator"]
+      |> Nx.multiply(state[:i])
+      |> Nx.add(d_loss)
+      |> Nx.divide(Nx.add(state[:i], 1))
+
+    new_g_loss =
+      state[:loss]["generator"]
+      |> Nx.multiply(state[:i])
+      |> Nx.add(g_loss)
+      |> Nx.divide(Nx.add(state[:i], 1))
+
+    new_loss = %{
+      "discriminator" => new_d_loss,
+      "generator" => new_g_loss
+    }
+
+    new_model_state = %{
+      "discriminator" => new_d_params,
+      "generator" => new_g_params
+    }
+
+    new_optimizer_state = %{
+      "discriminator" => new_d_optimizer_state,
+      "generator" => new_g_optimizer_state
+    }
+
+    %{
+      model_state: new_model_state,
+      optimizer_state: new_optimizer_state,
+      loss: new_loss,
+      i: Nx.add(state[:i], 1)
+    }
+  end
+
+  defn d_objective(
+         d_params,
+         g_params,
+         discriminator_fn,
+         generator_fn,
+         real_batch
+       ) do
+    batch_size = Nx.axis_size(real_batch, 0)
+    real_targets = Nx.broadcast(1, {batch_size, 1})
+    fake_targets = Nx.broadcast(0, {batch_size, 1})
+    key = Nx.Random.key(832)
+    {latent, _} = Nx.Random.normal(key, shape: {batch_size, 128})
+
+    %{prediction: fake_batch} = generator_fn.(g_params, latent)
+
+    %{prediction: real_labels} = discriminator_fn.(d_params, real_batch)
+    %{prediction: fake_labels} = discriminator_fn.(d_params, fake_batch)
+
+    real_loss =
+      Axon.Losses.binary_cross_entropy(
+        real_targets,
+        real_labels,
+        reduction: :mean
+      )
+
+    fake_loss =
+      Axon.Losses.binary_cross_entropy(
+        fake_targets,
+        fake_labels,
+        reduction: :mean
+      )
+
+    0.5 * real_loss + 0.5 * fake_loss
+  end
+
+  defn g_objective(
+         d_params,
+         g_params,
+         discriminator_fn,
+         generator_fn,
+         real_batch
+       ) do
+    batch_size = Nx.axis_size(real_batch, 0)
+    real_targets = Nx.broadcast(1, {batch_size, 1})
+    key = Nx.Random.key(737)
+    {latent, _} = Nx.Random.normal(key, shape: {batch_size, 128})
+
+    %{prediction: fake_batch} = generator_fn.(g_params, latent)
+    %{prediction: fake_labels} = discriminator_fn.(d_params, fake_batch)
+
+    Axon.Losses.binary_cross_entropy(
+      real_targets,
+      fake_labels,
+      reduction: :mean
+    )
+  end
+
+  defn init_state(
+         discriminator_init_fn,
+         generator_init_fn,
+         discriminator_optimizer_init,
+         generator_optimizer_init,
+         batch,
+         init_state
+       ) do
+    d_params = discriminator_init_fn.(batch, init_state)
+    key = Nx.Random.key(945)
+    {normal, _} = Nx.Random.normal(key, shape: {64, 128})
+    g_params = generator_init_fn.(normal, init_state)
+    d_optimizer_state = discriminator_optimizer_init.(d_params)
+    g_optimizer_state = generator_optimizer_init.(g_params)
+
+    model_state = %{
+      "discriminator" => d_params,
+      "generator" => g_params
+    }
+
+    optimizer_state = %{
+      "discriminator" => d_optimizer_state,
+      "generator" => g_optimizer_state
+    }
+
+    loss = %{
+      "discriminator" => Nx.tensor(0.0),
+      "generator" => Nx.tensor(0.0)
+    }
+
+    %{
+      model_state: model_state,
+      optimizer_state: optimizer_state,
+      loss: loss,
+      i: Nx.tensor(0)
+    }
+  end
+
+  def display_sample(
+        %Axon.Loop.State{step_state: state} = out_state,
+        generator_fn
+      ) do
+    key = Nx.Random.key(356)
+    {latent, _} = Nx.Random.normal(key, shape: {3, 128})
+    %{prediction: out} = generator_fn.(state[:model_state]["generator"], latent)
+
+    out_image =
+      Nx.multiply(out, 255)
+      |> Nx.as_type(:u8)
+
+    upsample =
+      Axon.Layers.resize(
+        out_image,
+        size: {512, 512},
+        channels: :last
+      )
+
+    for i <- 0..2 do
+      Kino.Image.new(Nx.reshape(upsample[i], {512, 512, 1}))
+      |> Kino.render()
+    end
+
+    {:continue, out_state}
+  end
+end
+```
+
+```elixir
+discriminator = GAN.discriminator(Axon.input("image"))
+generator = GAN.generator(Axon.input("latent"))
+
+{discriminator_init_fn, discriminator_fn} =
+  Axon.build(discriminator, mode: :train)
+
+{generator_init_fn, generator_fn} =
+  Axon.build(generator, mode: :train)
+
+{d_optimizer_init, d_optimizer} = Polaris.Optimizers.adam(learning_rate: 1.0e-4)
+{g_optimizer_init, g_optimizer} = Polaris.Optimizers.adam(learning_rate: 1.0e-3)
+
+init_fn =
+  &GAN.init_state(
+    discriminator_init_fn,
+    generator_init_fn,
+    d_optimizer_init,
+    g_optimizer_init,
+    &1,
+    &2
+  )
+
+step_fn =
+  &GAN.train_step(
+    discriminator_fn,
+    generator_fn,
+    d_optimizer,
+    g_optimizer,
+    &1,
+    &2
+  )
+
+
+```
+
+Notice that you’re using slightly different optimizers for each model. To prevent the discriminator from dominating the generator before it can get its bearings during training, you need to lower the learning rate of the discriminator.
+
+```elixir
+step_fn
+|> Axon.Loop.loop(init_fn)
+|> Axon.Loop.handle_event(
+  :epoch_completed,
+  &GAN.display_sample(&1, generator_fn)
+)
+|> Axon.Loop.log(
+  fn
+    %Axon.Loop.State{epoch: epoch, iteration: iter, step_state: state} ->
+      d_loss = state[:loss]["discriminator"]
+      g_loss = state[:loss]["generator"]
+
+      "\rEpoch: #{epoch}, batch: #{iter}," <>
+        " d_loss: #{Nx.to_number(d_loss)}," <>
+        " g_loss: #{Nx.to_number(g_loss)}"
+  end,
+  event: :iteration_completed,
+  device: :stdio
+)
+|> Axon.Loop.run(train_data, %{}, compiler: EXLA, epochs: 10)
 ```
