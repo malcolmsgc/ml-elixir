@@ -59,7 +59,11 @@ defmodule BookSearch.MixProject do
       {:jason, "~> 1.2"},
       {:dns_cluster, "~> 0.1.1"},
       {:bandit, "~> 1.5"},
-      {:pgvector, "~> 0.3.1"}
+      {:pgvector, "~> 0.3.1"},
+      {:bumblebee, "~> 0.6.3"},
+      {:nx, "~> 0.10.0"},
+      {:exla, "~> 0.10.0"},
+      {:explorer, "~> 0.10.0"},
     ]
   end
 
