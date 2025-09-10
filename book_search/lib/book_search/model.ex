@@ -29,4 +29,8 @@ defmodule BookSearch.Model do
       ]
     )
   end
+
+  def predict(text) do
+    Nx.Serving.batched_run(BookSearchModel, text)
+  end
 end
