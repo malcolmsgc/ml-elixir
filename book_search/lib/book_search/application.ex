@@ -14,6 +14,16 @@ defmodule BookSearch.Application do
       {Phoenix.PubSub, name: BookSearch.PubSub},
       # Start the Finch HTTP client for sending emails
       {Finch, name: BookSearch.Finch},
+      # start Nx.Serving process to enable inference
+      {Nx.Serving,
+       [
+         serving: BookSearch.Model.serving(defn_options: [compiler: EXLA]),
+         #  set max batch size before running inference
+         batch_size: 16,
+        #  set max wait in ms for batching before running inference
+         batch_timeout: 100,
+         name: BookSearchModel
+       ]},
       # Start a worker by calling: BookSearch.Worker.start_link(arg)
       # {BookSearch.Worker, arg},
       # Start to serve requests, typically the last entry
