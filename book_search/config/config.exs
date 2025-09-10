@@ -31,6 +31,9 @@ config :book_search, BookSearchWeb.Endpoint,
 # at the `config/runtime.exs`.
 config :book_search, BookSearch.Mailer, adapter: Swoosh.Adapters.Local
 
+# Config for PGVector support
+config :book_search, BookSearch.Repo, types: BookSearch.PostgrexTypes
+
 # Configure esbuild (the version is required)
 config :esbuild,
   version: "0.17.11",
