@@ -3,10 +3,10 @@ defmodule BookSearch.Library.Book do
   import Ecto.Changeset
 
   schema "books" do
-    field :description, :string
-    field :title, :string
-    field :author, :string
-    field :embedding, Pgvector.Ecto.Vector
+    field(:description, :string)
+    field(:title, :string)
+    field(:author, :string)
+    field(:embedding, Pgvector.Ecto.Vector)
 
     timestamps(type: :utc_datetime)
   end
@@ -15,6 +15,12 @@ defmodule BookSearch.Library.Book do
   def changeset(book, attrs) do
     book
     |> cast(attrs, [:author, :title, :description, :embedding])
-    |> validate_required([:author, :title, :description, :embedding])
+    |> validate_required([:author, :title, :description])
+  end
+
+  @doc false
+  def put_embedding(%{changes: %{description: descrip}} = book_changeset) do
+    %{embedding: embedding} = BookSearch.Model.predict(descrip)
+    put_change(book_changeset, :embedding, embedding)
   end
 end
