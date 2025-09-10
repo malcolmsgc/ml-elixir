@@ -8,10 +8,9 @@
 </.header>
 
 <.table id="books" rows={@books} row_click={&JS.navigate(~p"/books/#{&1}")}>
-  <:col :let={book} label=" author">{book. author}</:col>
+  <:col :let={book} label="Author">{book. author}</:col>
   <:col :let={book} label="Title">{book.title}</:col>
   <:col :let={book} label="Description">{book.description}</:col>
-  <:col :let={book} label="Embedding">{book.embedding}</:col>
   <:action :let={book}>
     <div class="sr-only">
       <.link navigate={~p"/books/#{book}"}>Show</.link>

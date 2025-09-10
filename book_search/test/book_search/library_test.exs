@@ -8,7 +8,7 @@ defmodule BookSearch.LibraryTest do
 
     import BookSearch.LibraryFixtures
 
-    @invalid_attrs %{description: nil, title: nil, " author": nil, embedding: nil}
+    @invalid_attrs %{description: nil, title: nil, author: nil, embedding: nil}
 
     test "list_books/0 returns all books" do
       book = book_fixture()
@@ -21,12 +21,17 @@ defmodule BookSearch.LibraryTest do
     end
 
     test "create_book/1 with valid data creates a book" do
-      valid_attrs = %{description: "some description", title: "some title", " author": "some  author", embedding: "some embedding"}
+      valid_attrs = %{
+        description: "some description",
+        title: "some title",
+        author: "some  author",
+        embedding: "some embedding"
+      }
 
       assert {:ok, %Book{} = book} = Library.create_book(valid_attrs)
       assert book.description == "some description"
       assert book.title == "some title"
-      assert book. author == "some  author"
+      assert book.author == "some  author"
       assert book.embedding == "some embedding"
     end
 
@@ -36,12 +41,18 @@ defmodule BookSearch.LibraryTest do
 
     test "update_book/2 with valid data updates the book" do
       book = book_fixture()
-      update_attrs = %{description: "some updated description", title: "some updated title", " author": "some updated  author", embedding: "some updated embedding"}
+
+      update_attrs = %{
+        description: "some updated description",
+        title: "some updated title",
+        author: "some updated  author",
+        embedding: "some updated embedding"
+      }
 
       assert {:ok, %Book{} = book} = Library.update_book(book, update_attrs)
       assert book.description == "some updated description"
       assert book.title == "some updated title"
-      assert book. author == "some updated  author"
+      assert book.author == "some updated  author"
       assert book.embedding == "some updated embedding"
     end
 

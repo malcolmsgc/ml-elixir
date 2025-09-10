@@ -3,9 +3,19 @@ defmodule BookSearchWeb.BookControllerTest do
 
   import BookSearch.LibraryFixtures
 
-  @create_attrs %{description: "some description", title: "some title", " author": "some  author", embedding: "some embedding"}
-  @update_attrs %{description: "some updated description", title: "some updated title", " author": "some updated  author", embedding: "some updated embedding"}
-  @invalid_attrs %{description: nil, title: nil, " author": nil, embedding: nil}
+  @create_attrs %{
+    description: "some description",
+    title: "some title",
+    author: "some  author",
+    embedding: "some embedding"
+  }
+  @update_attrs %{
+    description: "some updated description",
+    title: "some updated title",
+    author: "some updated  author",
+    embedding: "some updated embedding"
+  }
+  @invalid_attrs %{description: nil, title: nil, author: nil, embedding: nil}
 
   describe "index" do
     test "lists all books", %{conn: conn} do
@@ -71,9 +81,9 @@ defmodule BookSearchWeb.BookControllerTest do
       conn = delete(conn, ~p"/books/#{book}")
       assert redirected_to(conn) == ~p"/books"
 
-      assert_error_sent 404, fn ->
+      assert_error_sent(404, fn ->
         get(conn, ~p"/books/#{book}")
-      end
+      end)
     end
   end
 
