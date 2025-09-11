@@ -4,8 +4,9 @@ defmodule BookSearch.Library do
   """
 
   import Ecto.Query, warn: false
-  alias BookSearch.Repo
+  import Pgvector.Ecto.Query
 
+  alias BookSearch.Repo
   alias BookSearch.Library.Book
 
   @doc """
@@ -36,6 +37,18 @@ defmodule BookSearch.Library do
 
   """
   def get_book!(id), do: Repo.get!(Book, id)
+
+  @doc """
+  Searches for a book.
+  """
+  def search(query) do
+    %{embedding: embedding} = BookSearch.Model.predict(query)
+
+    Book
+    |> order_by([b], l2_distance(b.embedding, ^embedding))
+    |> limit(5)
+    |> Repo.all()
+  end
 
   @doc """
   Creates a book.
