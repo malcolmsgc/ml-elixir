@@ -19,7 +19,9 @@ defmodule BookSearch.Library do
 
   """
   def list_books do
-    Repo.all(Book)
+    Book
+    |> limit(10)
+    |> Repo.all()
   end
 
   @doc """
@@ -46,7 +48,7 @@ defmodule BookSearch.Library do
 
     Book
     |> order_by([b], l2_distance(b.embedding, ^embedding))
-    |> limit(5)
+    |> limit(8)
     |> Repo.all()
   end
 
