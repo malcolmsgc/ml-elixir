@@ -53,7 +53,7 @@ defmodule BookSearch.Library do
     book =
       %Book{}
       |> Book.changeset(attrs)
-      |> Repo.put_embedding()
+      |> Book.put_embedding()
 
     Repo.insert(book)
   end
